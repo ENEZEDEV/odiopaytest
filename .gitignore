@@ -1,2 +1,10 @@
-node_modules/
+data/
 .env
+.env.*
+!.env.example
+coverage/
+node_modules/
+*.log
+*.db
+*.db-shm
+*.db-wal
