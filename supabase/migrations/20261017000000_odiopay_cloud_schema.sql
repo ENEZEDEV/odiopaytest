@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS public.payment_intents (
     'succeeded',
     'failed',
     'cancelled',
+    'refunded',
+    'charged_back',
     'requires_reconciliation'
   )) DEFAULT 'created',
   mp_payment_id TEXT,
@@ -113,7 +115,7 @@ CREATE TABLE IF NOT EXISTS public.payments (
   fee_cents BIGINT NOT NULL,
   currency TEXT NOT NULL CHECK(currency = 'BRL'),
   method TEXT NOT NULL CHECK(method IN ('pix', 'card')),
-  status TEXT NOT NULL CHECK(status IN ('pending', 'succeeded', 'failed')),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'succeeded', 'failed', 'refunded', 'charged_back')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -133,7 +135,7 @@ CREATE TABLE IF NOT EXISTS public.wallet_journal (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   merchant_id UUID NOT NULL REFERENCES public.merchants(id) ON DELETE RESTRICT,
   source_id TEXT NOT NULL,
-  action TEXT NOT NULL CHECK(action IN ('settled', 'reserved', 'succeeded', 'failed')),
+  action TEXT NOT NULL CHECK(action IN ('settled', 'reserved', 'succeeded', 'failed', 'refunded', 'charged_back')),
   available_delta BIGINT NOT NULL,
   reserved_delta BIGINT NOT NULL,
   withdrawn_delta BIGINT NOT NULL,
@@ -143,7 +145,9 @@ CREATE TABLE IF NOT EXISTS public.wallet_journal (
     (action = 'settled' AND available_delta >= 0 AND reserved_delta = 0 AND withdrawn_delta = 0) OR
     (action = 'reserved' AND available_delta < 0 AND reserved_delta = -available_delta AND withdrawn_delta = 0) OR
     (action = 'succeeded' AND available_delta = 0 AND reserved_delta < 0 AND withdrawn_delta = -reserved_delta) OR
-    (action = 'failed' AND available_delta > 0 AND reserved_delta = -available_delta AND withdrawn_delta = 0)
+    (action = 'failed' AND available_delta > 0 AND reserved_delta = -available_delta AND withdrawn_delta = 0) OR
+    (action = 'refunded' AND available_delta <= 0 AND reserved_delta = 0 AND withdrawn_delta = 0) OR
+    (action = 'charged_back' AND available_delta <= 0 AND reserved_delta = 0 AND withdrawn_delta = 0)
   )
 );
 
@@ -370,6 +374,73 @@ BEGIN
 END;
 $$;
 
+
+-- Tratamento transacional de estorno e chargeback (pós-aprovação)
+CREATE OR REPLACE FUNCTION public.handle_payment_reversal(
+  p_intent_id UUID,
+  p_new_status TEXT,
+  p_status_detail TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_intent RECORD;
+BEGIN
+  IF p_new_status NOT IN ('refunded', 'charged_back') THEN
+    RAISE EXCEPTION 'invalid_reversal_status';
+  END IF;
+
+  SELECT * INTO v_intent
+  FROM public.payment_intents
+  WHERE id = p_intent_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN FALSE;
+  END IF;
+
+  -- Se já foi revertido para o mesmo estado, confirma idempotência
+  IF v_intent.status = p_new_status THEN
+    RETURN TRUE;
+  END IF;
+
+  -- Atualiza intenção e registro de pagamento
+  UPDATE public.payment_intents
+  SET status = p_new_status,
+      mp_status = p_new_status,
+      mp_status_detail = p_status_detail,
+      updated_at = NOW()
+  WHERE id = p_intent_id;
+
+  UPDATE public.payments
+  SET status = p_new_status
+  WHERE id = p_intent_id;
+
+  -- Se havia sido liquidado na carteira ('settled'), estorna o valor disponível
+  IF v_intent.status = 'succeeded' THEN
+    INSERT INTO public.wallet_journal (
+      merchant_id, source_id, action, available_delta, reserved_delta, withdrawn_delta
+    ) VALUES (
+      v_intent.merchant_id, v_intent.id::text, p_new_status,
+      -(v_intent.amount_cents - v_intent.fee_cents), 0, 0
+    )
+    ON CONFLICT (source_id, action) DO NOTHING;
+  END IF;
+
+  -- Registro no log imutável de auditoria
+  INSERT INTO public.audit_logs (merchant_id, entity_type, entity_id, action, payload)
+  VALUES (
+    v_intent.merchant_id, 'payment', v_intent.id::text, 'payment.' || p_new_status,
+    jsonb_build_object('status', p_new_status, 'status_detail', p_status_detail, 'reversal_cents', v_intent.amount_cents)
+  );
+
+  RETURN TRUE;
+END;
+$$;
+
 -- ------------------------------------------------------------------------------
 -- 9. Políticas de Segurança (Row Level Security - RLS)
 -- ------------------------------------------------------------------------------
@@ -384,16 +455,19 @@ ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.webhook_events ENABLE ROW LEVEL SECURITY;
 
 -- Políticas para Merchants
+DROP POLICY IF EXISTS merchants_owner_select ON public.merchants;
 CREATE POLICY merchants_owner_select ON public.merchants
   FOR SELECT TO authenticated
   USING (auth_user_id = auth.uid());
 
+DROP POLICY IF EXISTS merchants_owner_update ON public.merchants;
 CREATE POLICY merchants_owner_update ON public.merchants
   FOR UPDATE TO authenticated
   USING (auth_user_id = auth.uid())
   WITH CHECK (auth_user_id = auth.uid());
 
 -- Políticas para MP OAuth Connections
+DROP POLICY IF EXISTS oauth_conn_owner_select ON public.mp_oauth_connections;
 CREATE POLICY oauth_conn_owner_select ON public.mp_oauth_connections
   FOR SELECT TO authenticated
   USING (merchant_id = public.get_auth_merchant_id());
@@ -402,26 +476,31 @@ CREATE POLICY oauth_conn_owner_select ON public.mp_oauth_connections
 -- Apenas service_role / backend tem acesso!
 
 -- Políticas para Payment Intents (Lojista só pode LER suas próprias intenções; criação é pelo backend)
+DROP POLICY IF EXISTS payment_intents_owner_select ON public.payment_intents;
 CREATE POLICY payment_intents_owner_select ON public.payment_intents
   FOR SELECT TO authenticated
   USING (merchant_id = public.get_auth_merchant_id());
 
 -- Políticas para Payments
+DROP POLICY IF EXISTS payments_owner_select ON public.payments;
 CREATE POLICY payments_owner_select ON public.payments
   FOR SELECT TO authenticated
   USING (merchant_id = public.get_auth_merchant_id());
 
 -- Políticas para Accounting Entries
+DROP POLICY IF EXISTS accounting_owner_select ON public.accounting_entries;
 CREATE POLICY accounting_owner_select ON public.accounting_entries
   FOR SELECT TO authenticated
   USING (merchant_id = public.get_auth_merchant_id());
 
 -- Políticas para Wallet Journal
+DROP POLICY IF EXISTS wallet_journal_owner_select ON public.wallet_journal;
 CREATE POLICY wallet_journal_owner_select ON public.wallet_journal
   FOR SELECT TO authenticated
   USING (merchant_id = public.get_auth_merchant_id());
 
 -- Políticas para Audit Logs
+DROP POLICY IF EXISTS audit_logs_owner_select ON public.audit_logs;
 CREATE POLICY audit_logs_owner_select ON public.audit_logs
   FOR SELECT TO authenticated
   USING (merchant_id = public.get_auth_merchant_id());

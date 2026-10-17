@@ -25,12 +25,15 @@
   <div class="entry">
     <span class="pill">AMBIENTE DE HOMOLOGAÇÃO</span>
     <h2>Conheça sua<br>nova conta.</h2>
-    <p>Explore o painel com uma loja de homologação. Crie cobranças e experimente fluxos com valores fictícios.</p>
+    <p>Acesse o painel demonstrativo de homologação. Visualize o fluxo de cobranças e saques com valores fictícios.</p>
     <button id="enter" class="primary">Entrar no painel de homologação <span>↗</span></button>
-    <p class="small">Modo de testes ativo · Nenhum dinheiro real é movimentado.<br>Credenciais de produção desabilitadas.</p>
+    <div class="demo-auth-box">
+      <strong>Acesso Demonstrativo Local</strong>
+      <p>Sessão local sem conexão direta ao Supabase Auth. Operações financeiras desabilitadas por segurança.</p>
+    </div>
     <p id="login-error" role="alert"></p>
     <div class="creator-credit entry-credit">
-      <img src="/nz-dev.jpg" alt="">
+      <img src="/nz-dev.jpg" alt="NZ DEV">
       <span>Desenvolvido por <strong>NZ DEV</strong></span>
     </div>
   </div>
@@ -41,8 +44,8 @@
       <img class="brand-logo" src="/nz-dev.jpg" alt="NZ DEV">ODIOPAY<span class="brand-dot">.</span>
     </a>
     <div class="workspace">
-      <span class="avatar">ML</span>
-      <div><strong>Minha loja</strong><small>Homologação Sandbox</small></div>
+      <span class="avatar">NZ</span>
+      <div><strong>Loja Homologação</strong><small>Modo Demonstrativo</small></div>
       <span>⌄</span>
     </div>
     <div class="nav-label">SEU NEGÓCIO</div>
@@ -55,7 +58,7 @@
     <div class="sidebar-bottom">
       <div class="sandbox-note">
         <span class="live-dot"></span>Homologação ativa
-        <p>Valores demonstrativos.<br>Sem dinheiro real.</p>
+        <p>Acesso demonstrativo local.<br>Operações financeiras travadas.</p>
       </div>
       <button id="logout" class="nav-item"><span>↪</span>Sair do painel</button>
     </div>
@@ -65,17 +68,20 @@
       <span>Espaço financeiro <span class="slash">/</span> <strong id="breadcrumb">Visão geral</strong></span>
       <div>
         <span class="pill">HOMOLOGAÇÃO</span>
-        <span class="avatar">ML</span>
+        <span class="avatar">NZ</span>
       </div>
     </header>
+    <div class="notice-bar">
+      <span>ℹ️ <strong>Painel em Homologação Demonstrativa:</strong> Acesso local sem Supabase Auth. Botões de criação de cobranças e saques externos permanecem desabilitados até a publicação final e configuração de chaves Mercado Pago.</span>
+    </div>
     <main>
       <div class="page-heading">
         <div>
           <p class="eyebrow" id="greeting">BOM TER VOCÊ POR AQUI</p>
           <h1 id="page-title">Seu negócio em movimento<span>.</span></h1>
-          <p id="page-description">Tudo o que você precisa acompanhar, em uma visão unificada.</p>
+          <p id="page-description">Tudo o que você precisa acompanhar, em uma visão demonstrativa.</p>
         </div>
-        <button id="new-payment" class="primary">＋ Nova cobrança (Teste)</button>
+        <button id="new-payment" class="primary disabled-btn" title="Desabilitado em homologação: aguardando credenciais externas">＋ Nova cobrança (Desabilitado)</button>
       </div>
       <div id="overview-view" class="view">
         <section class="metrics" aria-label="Resumo financeiro">
@@ -84,7 +90,7 @@
             <strong id="available">—</strong>
             <div class="balance-bottom">
               <span>Saldo fictício sandbox</span>
-              <button id="withdraw-shortcut">Simular saque ↗</button>
+              <button id="withdraw-shortcut" class="disabled-link" title="Saque desabilitado em homologação">Simular saque 🔒</button>
             </div>
           </article>
           <article class="metric-card">
@@ -105,7 +111,7 @@
                 <h2>Seus recebimentos</h2>
                 <p>Composição das cobranças desta loja (homologação)</p>
               </div>
-              <span class="pill neutral">SANDBOX</span>
+              <span class="pill neutral">DEMO</span>
             </div>
             <div class="activity-total">
               <strong id="gross">—</strong>
@@ -121,9 +127,9 @@
           <article class="quick-card">
             <span class="eyebrow">HOMOLOGAÇÃO MERCADO PAGO</span>
             <h2>Split 1:1 e<br>Payments API.</h2>
-            <p>Crie uma cobrança de teste e acompanhe<br>cada etapa até a conciliação do saldo.</p>
-            <button id="create-pix" class="text-action">Cobrança Pix (Teste) <span>↗</span></button>
-            <div class="orb" aria-hidden="true">↗</div>
+            <p>Split transparente e tarifas aplicadas no backend.<br>Transações financeiras reais desabilitadas.</p>
+            <button id="create-pix" class="text-action disabled-link" title="Cobrança Pix desabilitada em homologação">Cobrança Pix (Desabilitado) 🔒</button>
+            <div class="orb" aria-hidden="true">🔒</div>
           </article>
         </section>
       </div>
@@ -131,7 +137,7 @@
         <div class="section-head">
           <div>
             <h2 id="table-title">Últimas cobranças</h2>
-            <p>Movimentações e status em tempo real em homologação</p>
+            <p>Histórico demonstrativo em homologação</p>
           </div>
           <button id="refresh" class="secondary">↻ Atualizar</button>
         </div>
@@ -159,7 +165,7 @@
                 <th>LÍQUIDO</th>
                 <th>STATUS</th>
                 <th>DATA</th>
-                <th><span class="sr-only">Ações</span></th>
+                <th>ESTADO</th>
               </tr>
             </thead>
             <tbody id="payment-rows"></tbody>
@@ -168,7 +174,7 @@
         <p id="empty-payments" class="empty" hidden>Nenhuma cobrança encontrada para este filtro.</p>
         <div class="table-footer">
           <span id="row-count"></span>
-          <span>BRL · Real brasileiro (Valores de teste)</span>
+          <span>BRL · Valores ilustrativos</span>
         </div>
       </section>
       <section id="wallet-view" class="view" hidden>
@@ -176,15 +182,15 @@
           <div>
             <span class="eyebrow">SALDO DEMONSTRATIVO (NÃO REAL)</span>
             <h2 id="wallet-available">—</h2>
-            <p>Os saques reais ocorrem diretamente na sua conta Mercado Pago conectada via split 1:1.</p>
+            <p>Saques e liquidações bancárias desabilitados nesta fase de homologação.</p>
           </div>
-          <button id="new-withdrawal" class="primary">Simular saque ↗</button>
+          <button id="new-withdrawal" class="primary disabled-btn" title="Saque desabilitado em homologação">Solicitar saque (Desabilitado)</button>
         </div>
         <section class="panel">
           <div class="section-head">
             <div>
-              <h2>Histórico de saques simulados</h2>
-              <p>Acompanhe as reservas e simulações</p>
+              <h2>Histórico de saques</h2>
+              <p>Histórico demonstrativo de saques</p>
             </div>
           </div>
           <div class="table-scroll">
@@ -195,13 +201,13 @@
                   <th>VALOR</th>
                   <th>STATUS</th>
                   <th>DATA</th>
-                  <th>AÇÕES DO SIMULADOR</th>
+                  <th>ESTADO</th>
                 </tr>
               </thead>
               <tbody id="withdrawal-rows"></tbody>
             </table>
           </div>
-          <p id="empty-withdrawals" class="empty">Seus saques simulados aparecerão aqui.</p>
+          <p id="empty-withdrawals" class="empty" hidden>Seus saques simulados aparecerão aqui.</p>
         </section>
       </section>
       <section id="plans-view" class="view plans" hidden>
@@ -227,59 +233,18 @@
             <dd>2,99% + R$ 0,30</dd>
           </dl>
         </article>
-        <p class="plan-note">Tarifas calculadas estritamente no backend. Planos controlados pelo servidor.</p>
+        <p class="plan-note">Tarifas calculadas estritamente no backend. Planos e comissões protegidos contra adulteração.</p>
       </section>
       <footer>
         <span class="creator-credit">
-          <img src="/nz-dev.jpg" alt="">
+          <img src="/nz-dev.jpg" alt="NZ DEV">
           <span>ODIOPAY · Desenvolvido por <strong>NZ DEV</strong></span>
         </span>
-        <span class="footer-right">Valores demonstrativos · Homologação ativa · Nenhuma transação financeira real</span>
+        <span class="footer-right">Valores demonstrativos · Homologação ativa · Sem movimentação financeira real</span>
       </footer>
     </main>
   </div>
 </div>
-<dialog id="payment-dialog">
-  <form id="payment-form">
-    <div class="dialog-head">
-      <span class="pill">NOVA COBRANÇA · HOMOLOGAÇÃO</span>
-      <button type="button" class="close" aria-label="Fechar nova cobrança">×</button>
-    </div>
-    <h2>Um novo recebimento.</h2>
-    <p>Escolha o meio e informe o valor da cobrança de teste.</p>
-    <label>Meio de pagamento
-      <select name="method" id="payment-method">
-        <option value="pix">Pix</option>
-        <option value="card">Cartão</option>
-      </select>
-    </label>
-    <label>Valor em reais
-      <input name="amount" inputmode="decimal" placeholder="0,00" required pattern="[0-9]+([,.][0-9]{1,2})?" maxlength="10" autocomplete="off">
-    </label>
-    <div class="form-note">Ambiente de homologação. Tarifas aplicadas pelo servidor no split 1:1.</div>
-    <p class="form-error" role="alert"></p>
-    <button class="primary" type="submit">Criar cobrança de teste ↗</button>
-  </form>
-</dialog>
-<dialog id="withdraw-dialog">
-  <form id="withdraw-form">
-    <div class="dialog-head">
-      <span class="pill">SAQUE SIMULADO · SANDBOX</span>
-      <button type="button" class="close" aria-label="Fechar saque">×</button>
-    </div>
-    <h2>Simulação de saque.</h2>
-    <p id="withdraw-balance"></p>
-    <label>Valor em reais
-      <input name="amount" inputmode="decimal" placeholder="0,00" required pattern="[0-9]+([,.][0-9]{1,2})?" maxlength="10" autocomplete="off">
-    </label>
-    <label>Destino
-      <select name="destination" id="destination"></select>
-    </label>
-    <div class="form-note">Destino fictício de sandbox. Nenhum valor bancário real é movimentado.</div>
-    <p class="form-error" role="alert"></p>
-    <button class="primary" type="submit">Confirmar reserva simulada ↗</button>
-  </form>
-</dialog>
 <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

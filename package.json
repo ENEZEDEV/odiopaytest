@@ -3,12 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Núcleo financeiro ODIOPAY — Lovable Cloud & Supabase com Mercado Pago Split 1:1 e testes automatizados",
+  "description": "N\u00facleo financeiro ODIOPAY \u2014 Lovable Cloud & Supabase com Mercado Pago Split 1:1 e testes automatizados",
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
-    "test": "node --test test/*.test.js && node --experimental-strip-types --test tests/postgresql-cloud.test.js tests/edge-functions-cloud.test.js",
+    "test": "node --test test/*.test.js && node --experimental-strip-types --test tests/postgresql-cloud.test.js tests/edge-functions-cloud.test.js tests/edge-functions-http.test.js",
     "test:original": "node --test test/*.test.js",
     "test:cloud": "node --experimental-strip-types --test tests/postgresql-cloud.test.js tests/edge-functions-cloud.test.js",
     "check": "node scripts/check.js",

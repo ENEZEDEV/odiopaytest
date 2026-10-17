@@ -240,4 +240,113 @@ describe('ODIOPAY - Testes Rigorosos de Edge Functions e Idempotência', () => {
     );
     assert.equal(replayRes.rows.length, 0, 'Replay de webhook existente deve ser ignorado sem reprocessamento');
   });
+
+  test('8. Webhook: eventos persistidos mas não concluídos (status=failed ou received) são reprocessados', async () => {
+    const intentId = randomUUID();
+    const mpPaymentId = `mp-pay-retry-${randomUUID()}`;
+    const key = `key-hook-retry-${randomUUID()}`;
+
+    // Cria a intenção pendente
+    await pool.query(
+      `INSERT INTO public.payment_intents (id, merchant_id, idempotency_key, request_digest, amount_cents, fee_cents, currency, method, payer_email, status, mp_payment_id)
+       VALUES ($1, $2, $3, 'digest-wh-retry', 15000, 100, 'BRL', 'pix', 'retry@exemplo.com', 'processing', $4);`,
+      [intentId, merchantA_id, key, mpPaymentId]
+    );
+
+    const eventId = `evt-retry-${randomUUID()}`;
+    const ts = String(Math.floor(Date.now() / 1000));
+    const requestId = `req-retry-${randomUUID()}`;
+    const manifest = `id:${mpPaymentId};request-id:${requestId};ts:${ts};`;
+    const validSignature = await hmacSha256Hex(webhookSecret, manifest);
+
+    // Simula que o evento foi inserido inicialmente com status 'failed' (ex: falha transitória de rede upstream)
+    await pool.query(
+      `INSERT INTO public.webhook_events (event_id, resource_id, topic, signature, payload, status)
+       VALUES ($1, $2, 'payment.updated', $3, '{"action":"payment.updated"}'::jsonb, 'failed');`,
+      [eventId, mpPaymentId, `ts=${ts},v1=${validSignature}`]
+    );
+
+    // Na re-tentativa pelo Mercado Pago: consulta evento anterior
+    const existing = await pool.query('SELECT * FROM public.webhook_events WHERE event_id = $1;', [eventId]);
+    assert.equal(existing.rows.length, 1);
+    assert.equal(existing.rows[0].status, 'failed');
+
+    // Ao invés de descartar com already_processed, atualiza status para 'received' e conclui liquidação
+    await pool.query(
+      `UPDATE public.webhook_events SET status = 'received' WHERE event_id = $1;`,
+      [eventId]
+    );
+
+    // Liquida a transação
+    const settle = await pool.query(
+      `SELECT public.settle_payment_transaction($1, $2, 'accredited') as settled;`,
+      [intentId, mpPaymentId]
+    );
+    assert.equal(settle.rows[0].settled, true);
+
+    // Marca evento como processado
+    await pool.query(
+      `UPDATE public.webhook_events SET status = 'processed', processed_at = NOW() WHERE event_id = $1;`,
+      [eventId]
+    );
+
+    const finalEvt = await pool.query('SELECT status FROM public.webhook_events WHERE event_id = $1;', [eventId]);
+    assert.equal(finalEvt.rows[0].status, 'processed');
+
+    const finalIntent = await pool.query('SELECT status FROM public.payment_intents WHERE id = $1;', [intentId]);
+    assert.equal(finalIntent.rows[0].status, 'succeeded');
+  });
+
+  test('9. Webhook: alteração posterior à aprovação (estorno / chargeback)', async () => {
+    const intentId = randomUUID();
+    const mpPaymentId = `mp-pay-reversal-${randomUUID()}`;
+    const key = `key-hook-rev-${randomUUID()}`;
+
+    // Cria e liquida a transação como 'succeeded'
+    await pool.query(
+      `INSERT INTO public.payment_intents (id, merchant_id, idempotency_key, request_digest, amount_cents, fee_cents, currency, method, payer_email, status, mp_payment_id)
+       VALUES ($1, $2, $3, 'digest-wh-rev', 50000, 100, 'BRL', 'pix', 'rev@exemplo.com', 'processing', $4);`,
+      [intentId, merchantA_id, key, mpPaymentId]
+    );
+
+    await pool.query(
+      `SELECT public.settle_payment_transaction($1, $2, 'accredited');`,
+      [intentId, mpPaymentId]
+    );
+
+    // Saldo disponível após liquidação deve ser R$ 499,00 (50000 - 100 = 49900 centavos)
+    const journalAfterSettle = await pool.query(
+      `SELECT available_delta FROM public.wallet_journal WHERE source_id = $1 AND action = 'settled';`,
+      [intentId]
+    );
+    assert.equal(journalAfterSettle.rows[0].available_delta, '49900');
+
+    // Mercado Pago envia notificação de alteração pós-aprovação: 'refunded'
+    const reversalResult = await pool.query(
+      `SELECT public.handle_payment_reversal($1, 'refunded', 'refunded_by_seller') as reversed;`,
+      [intentId]
+    );
+    assert.equal(reversalResult.rows[0].reversed, true);
+
+    // Verifica que o status da intenção mudou para 'refunded'
+    const intentRev = await pool.query('SELECT status FROM public.payment_intents WHERE id = $1;', [intentId]);
+    assert.equal(intentRev.rows[0].status, 'refunded');
+
+    // Verifica lançamento estornando saldo disponível no diário da carteira
+    const journalRev = await pool.query(
+      `SELECT action, available_delta FROM public.wallet_journal WHERE source_id = $1 AND action = 'refunded';`,
+      [intentId]
+    );
+    assert.equal(journalRev.rows.length, 1);
+    assert.equal(journalRev.rows[0].available_delta, '-49900', 'Estorno deve debitar exatamente o saldo creditado');
+
+    // Verifica registro imutável no log de auditoria
+    const auditRev = await pool.query(
+      `SELECT action, payload FROM public.audit_logs WHERE entity_id = $1 AND action = 'payment.refunded';`,
+      [intentId]
+    );
+    assert.equal(auditRev.rows.length, 1);
+    assert.equal(auditRev.rows[0].payload.status, 'refunded');
+  });
 });
+

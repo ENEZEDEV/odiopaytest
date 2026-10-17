@@ -38,7 +38,7 @@ serve(async (req) => {
     }
 
     // 1. Verificação oficial da assinatura do webhook Mercado Pago
-    // Formato do x-signature: ts=1700000000,v1=abcdef...
+    // Formato: ts=1700000000,v1=abcdef...
     const sigParts = Object.fromEntries(
       xSignature.split(",").map((p) => {
         const [k, ...v] = p.trim().split("=");
@@ -56,8 +56,6 @@ serve(async (req) => {
       });
     }
 
-    // Template oficial de manifest do Mercado Pago:
-    // id:[data.id];request-id:[x-request-id];ts:[ts];
     const manifest = `id:${dataId};request-id:${xRequestId};ts:${ts};`;
     const computedHmac = await hmacSha256Hex(webhookSecret, manifest);
 
@@ -72,8 +70,9 @@ serve(async (req) => {
     const eventId = String(body.id || `${xRequestId}:${dataId}`);
     const topic = String(body.action || body.type || "payment");
 
-    // 2. Persistência durável e deduplicação de eventos antes de processar
-    const { data: insertedEvent, error: insertError } = await supabaseAdmin
+    // 2. Persistência durável, deduplicação e recuperação de eventos incompletos
+    let isRetry = false;
+    const { error: insertError } = await supabaseAdmin
       .from("webhook_events")
       .insert({
         event_id: eventId,
@@ -82,25 +81,52 @@ serve(async (req) => {
         signature: xSignature,
         payload: body,
         status: "received",
-      })
-      .select()
-      .maybeSingle();
+      });
 
     if (insertError) {
       if (insertError.code === "23505") {
-        // Evento já persistido e deduplicado
-        return new Response(JSON.stringify({ received: true, status: "already_processed" }), {
-          status: 200,
+        // Evento já existe no banco: verificar status anterior
+        const { data: existingEvent, error: fetchErr } = await supabaseAdmin
+          .from("webhook_events")
+          .select("id, status, payload")
+          .eq("event_id", eventId)
+          .single();
+
+        if (fetchErr || !existingEvent) {
+          return new Response(JSON.stringify({ error: { code: "database_error", message: "Failed to read existing webhook" } }), {
+            status: 500,
+            headers: corsHeaders,
+          });
+        }
+
+        // Se já foi processado com sucesso ('processed') e não é nova ação, deduplica sem reprocessar
+        if (existingEvent.status === "processed" && topic !== "payment.updated") {
+          return new Response(JSON.stringify({ received: true, status: "already_processed" }), {
+            status: 200,
+            headers: corsHeaders,
+          });
+        }
+
+        // Se o evento anterior estava incompleto ('received' ou 'failed') ou é atualização de status,
+        // permite reprocessamento e recupera o fluxo
+        isRetry = true;
+        await supabaseAdmin
+          .from("webhook_events")
+          .update({
+            status: "received",
+            signature: xSignature,
+            payload: body,
+          })
+          .eq("event_id", eventId);
+      } else {
+        return new Response(JSON.stringify({ error: { code: "database_error", message: "Failed to persist webhook event" } }), {
+          status: 500,
           headers: corsHeaders,
         });
       }
-      return new Response(JSON.stringify({ error: { code: "database_error", message: "Failed to persist webhook event" } }), {
-        status: 500,
-        headers: corsHeaders,
-      });
     }
 
-    // 3. Consulta ao banco para localizar a intenção de pagamento
+    // 3. Consulta da intenção no banco
     const { data: intent, error: intentError } = await supabaseAdmin
       .from("payment_intents")
       .select("*")
@@ -108,23 +134,13 @@ serve(async (req) => {
       .maybeSingle();
 
     if (intentError || !intent) {
-      // Se a intenção não estiver associada ao mp_payment_id direto, tenta por id se for UUID
       return new Response(JSON.stringify({ received: true, status: "intent_not_found" }), {
         status: 200,
         headers: corsHeaders,
       });
     }
 
-    // Tratamento de eventos fora de ordem: se já estiver em estado terminal 'succeeded', não re-processa
-    if (intent.status === "succeeded") {
-      await supabaseAdmin.from("webhook_events").update({ status: "processed", processed_at: new Date().toISOString() }).eq("event_id", eventId);
-      return new Response(JSON.stringify({ received: true, status: "already_succeeded", intentId: intent.id }), {
-        status: 200,
-        headers: corsHeaders,
-      });
-    }
-
-    // 4. Recupera e decifra o token OAuth do vendedor para consultar o Mercado Pago
+    // 4. Recupera e decifra o token OAuth do vendedor
     const { data: oauthConn } = await supabaseAdmin
       .from("mp_oauth_connections")
       .select("*")
@@ -174,28 +190,55 @@ serve(async (req) => {
       });
     }
 
-    // 7. Atualização transacional de estado
+    // 7. Atualização transacional de estado e tratamento de alterações posteriores à aprovação
     if (mpPayment.status === "approved") {
+      if (intent.status === "succeeded") {
+        // Já aprovado anteriormente; confirmação idempotente
+        await supabaseAdmin
+          .from("webhook_events")
+          .update({ status: "processed", processed_at: new Date().toISOString() })
+          .eq("event_id", eventId);
+
+        return new Response(
+          JSON.stringify({ received: true, status: "already_succeeded", intentId: intent.id, isRetry }),
+          { status: 200, headers: corsHeaders }
+        );
+      }
+
       await supabaseAdmin.rpc("settle_payment_transaction", {
         p_intent_id: intent.id,
         p_mp_payment_id: String(dataId),
         p_status_detail: mpPayment.status_detail || "accredited",
       });
-    } else if (mpPayment.status === "rejected") {
-      await supabaseAdmin.from("payment_intents").update({
-        status: "failed",
-        mp_status: mpPayment.status,
-        mp_status_detail: mpPayment.status_detail,
-      }).eq("id", intent.id);
+    } else if (mpPayment.status === "refunded" || mpPayment.status === "charged_back") {
+      // Alteração posterior à aprovação: estorno ou disputa
+      await supabaseAdmin.rpc("handle_payment_reversal", {
+        p_intent_id: intent.id,
+        p_new_status: mpPayment.status,
+        p_status_detail: mpPayment.status_detail || "reversed",
+      });
+    } else if (mpPayment.status === "rejected" || mpPayment.status === "cancelled") {
+      if (intent.status !== "succeeded" && intent.status !== "refunded" && intent.status !== "charged_back") {
+        await supabaseAdmin
+          .from("payment_intents")
+          .update({
+            status: mpPayment.status === "cancelled" ? "cancelled" : "failed",
+            mp_status: mpPayment.status,
+            mp_status_detail: mpPayment.status_detail,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", intent.id);
+      }
     }
 
+    // Marca evento como processado com sucesso
     await supabaseAdmin.from("webhook_events").update({
       status: "processed",
       processed_at: new Date().toISOString(),
     }).eq("event_id", eventId);
 
     return new Response(
-      JSON.stringify({ received: true, status: "processed", intentId: intent.id }),
+      JSON.stringify({ received: true, status: "processed", intentId: intent.id, isRetry, paymentStatus: mpPayment.status }),
       { status: 200, headers: corsHeaders }
     );
   } catch (err: any) {
