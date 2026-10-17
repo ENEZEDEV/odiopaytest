@@ -1,65 +1,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { sha256Hex, decryptAesGcm } from "../_shared/crypto.ts";
+import { calculateServerFee } from "../_shared/tariffs.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, idempotency-key",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
-
-const TARIFFS: Record<string, Record<string, { bps: number; fixedCents: number }>> = {
-  standard: {
-    pix: { bps: 0, fixedCents: 100 },
-    card: { bps: 399, fixedCents: 39 },
-  },
-  pro: {
-    pix: { bps: 0, fixedCents: 50 },
-    card: { bps: 299, fixedCents: 30 },
-  },
-};
-
-function calculateServerFee(amountCents: number, method: string, plan: string): number {
-  const tariff = TARIFFS[plan] || TARIFFS.standard;
-  const rule = tariff[method];
-  if (!rule) throw new Error("invalid_payment_method");
-  const proportional = (BigInt(amountCents) * BigInt(rule.bps) + 9999n) / 10000n;
-  const fee = Number(proportional) + rule.fixedCents;
-  return Math.min(amountCents, fee);
-}
-
-// AES-GCM Decryption of encrypted OAuth token envelope
-async function decryptToken(envelopeJson: string, secretKeyHex: string, aadContext: string): Promise<string> {
-  const envelope = JSON.parse(envelopeJson);
-  const iv = Uint8Array.from(atob(envelope.iv), (c) => c.charCodeAt(0));
-  const tag = Uint8Array.from(atob(envelope.tag), (c) => c.charCodeAt(0));
-  const data = Uint8Array.from(atob(envelope.data), (c) => c.charCodeAt(0));
-
-  const keyBytes = new Uint8Array(secretKeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)));
-  const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"]);
-
-  const combined = new Uint8Array(data.length + tag.length);
-  combined.set(data, 0);
-  combined.set(tag, data.length);
-
-  const decryptedBuf = await crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv,
-      additionalData: new TextEncoder().encode(aadContext),
-      tagLength: 128,
-    },
-    cryptoKey,
-    combined
-  );
-
-  const decryptedText = new TextDecoder().decode(decryptedBuf);
-  try {
-    const parsed = JSON.parse(decryptedText);
-    return typeof parsed === "string" ? parsed : parsed.accessToken || decryptedText;
-  } catch {
-    return decryptedText;
-  }
-}
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -95,7 +43,7 @@ serve(async (req) => {
       );
     }
 
-    // 1. Derive merchant strictly from authenticated user identity
+    // 1. Identidade do lojista derivada estritamente de auth.uid()
     const { data: merchant, error: merchantError } = await supabaseAdmin
       .from("merchants")
       .select("id, name, plan")
@@ -104,7 +52,7 @@ serve(async (req) => {
 
     if (merchantError || !merchant) {
       return new Response(
-        JSON.stringify({ error: { code: "merchant_not_found", message: "Merchant profile not registered for user" } }),
+        JSON.stringify({ error: { code: "merchant_not_found", message: "Merchant profile not registered" } }),
         { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -120,7 +68,7 @@ serve(async (req) => {
     const body = await req.json();
     const { amountCents, method, payerEmail, cardToken, paymentMethodId } = body;
 
-    // 2. Strict Input Validation
+    // 2. Validação estrita de entrada
     if (!Number.isSafeInteger(amountCents) || amountCents < 100 || amountCents > 100000000) {
       return new Response(
         JSON.stringify({ error: { code: "invalid_amount", message: "Amount must be between 100 and 100,000,000 cents" } }),
@@ -140,10 +88,10 @@ serve(async (req) => {
       );
     }
 
-    // 3. Server-side fee calculation (Client fee values are discarded)
+    // 3. Cálculo de tarifas estritamente no servidor (qualquer tarifa vinda do cliente é desconsiderada)
     const feeCents = calculateServerFee(amountCents, method, merchant.plan);
 
-    // Compute request digest for idempotency conflict detection
+    // Digest da requisição para verificar integridade da idempotência
     const digestData = JSON.stringify({
       merchantId: merchant.id,
       amountCents,
@@ -153,10 +101,42 @@ serve(async (req) => {
       cardToken: method === "card" ? cardToken : null,
       paymentMethodId: method === "card" ? paymentMethodId : null,
     });
-    const hashBuffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(digestData));
-    const requestDigest = Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    const requestDigest = await sha256Hex(digestData);
 
-    // 4. Idempotency Check
+    // 4. Conexão OAuth do lojista vendedor
+    const { data: oauthConn, error: oauthError } = await supabaseAdmin
+      .from("mp_oauth_connections")
+      .select("*")
+      .eq("merchant_id", merchant.id)
+      .eq("status", "active")
+      .single();
+
+    if (oauthError || !oauthConn) {
+      return new Response(
+        JSON.stringify({ error: { code: "oauth_connection_required", message: "Merchant must connect Mercado Pago via OAuth" } }),
+        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    const aadContext = `mp:oauth:${merchant.id}:${oauthConn.seller_id}`;
+    let sellerAccessToken = "";
+    try {
+      sellerAccessToken = await decryptAesGcm(oauthConn.encrypted_access_token, encryptionKey, aadContext);
+    } catch {
+      return new Response(
+        JSON.stringify({ error: { code: "credentials_decryption_error", message: "Failed to decrypt seller credentials" } }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!sellerAccessToken.startsWith("TEST-")) {
+      return new Response(
+        JSON.stringify({ error: { code: "mp_test_credentials_required", message: "Production credentials prohibited in homologation" } }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // 5. Verificação de Idempotência no Banco
     const { data: existingIntent } = await supabaseAdmin
       .from("payment_intents")
       .select("*")
@@ -167,12 +147,57 @@ serve(async (req) => {
     if (existingIntent) {
       if (existingIntent.request_digest !== requestDigest) {
         return new Response(
-          JSON.stringify({ error: { code: "idempotency_conflict", message: "Key already used with different parameters" } }),
+          JSON.stringify({ error: { code: "idempotency_conflict", message: "Idempotency key already used with different parameters" } }),
           { status: 409, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
-      // Replay sanitized cached response
+      if (existingIntent.status === "processing") {
+        return new Response(
+          JSON.stringify({ error: { code: "payment_in_progress", message: "Payment is currently processing" } }),
+          { status: 409, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Reconciliação caso tenha ficado pendente após timeout anterior
+      if (existingIntent.status === "requires_reconciliation") {
+        const searchRes = await fetch(`https://api.mercadopago.com/v1/payments/search?external_reference=${existingIntent.id}`, {
+          headers: { Authorization: `Bearer ${sellerAccessToken}` },
+        }).catch(() => null);
+
+        if (searchRes && searchRes.ok) {
+          const searchData = await searchRes.json();
+          const match = searchData.results?.find((p: any) =>
+            p.live_mode === false &&
+            String(p.collector_id) === String(oauthConn.seller_id) &&
+            p.currency_id === "BRL" &&
+            Number(p.transaction_amount) === Number((existingIntent.amount_cents / 100).toFixed(2)) &&
+            p.external_reference === existingIntent.id
+          );
+
+          if (match) {
+            if (match.status === "approved") {
+              await supabaseAdmin.rpc("settle_payment_transaction", {
+                p_intent_id: existingIntent.id,
+                p_mp_payment_id: String(match.id),
+                p_status_detail: match.status_detail || "accredited",
+              });
+              existingIntent.status = "succeeded";
+              existingIntent.mp_payment_id = String(match.id);
+            }
+          }
+        }
+
+        // Se ainda não foi encontrado na conciliação, NÃO cria cobrança duplicada! Mantém pendente.
+        if (existingIntent.status === "requires_reconciliation") {
+          return new Response(
+            JSON.stringify({ error: { code: "gateway_timeout", message: "Payment is pending reconciliation" } }),
+            { status: 504, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+      }
+
+      // Replay seguro e sanitizado da resposta anterior
       return new Response(
         JSON.stringify({
           payment: {
@@ -197,41 +222,7 @@ serve(async (req) => {
       );
     }
 
-    // 5. Retrieve and Decrypt OAuth credentials of the merchant
-    const { data: oauthConn, error: oauthError } = await supabaseAdmin
-      .from("mp_oauth_connections")
-      .select("*")
-      .eq("merchant_id", merchant.id)
-      .eq("status", "active")
-      .single();
-
-    if (oauthError || !oauthConn) {
-      return new Response(
-        JSON.stringify({ error: { code: "oauth_connection_required", message: "Merchant must connect Mercado Pago via OAuth" } }),
-        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    const aadContext = `mp:oauth:${merchant.id}:${oauthConn.seller_id}`;
-    let sellerAccessToken = "";
-    try {
-      sellerAccessToken = await decryptToken(oauthConn.encrypted_access_token, encryptionKey, aadContext);
-    } catch {
-      return new Response(
-        JSON.stringify({ error: { code: "credentials_decryption_error", message: "Failed to decrypt credentials" } }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    // Homologation check
-    if (!sellerAccessToken.startsWith("TEST-")) {
-      return new Response(
-        JSON.stringify({ error: { code: "mp_test_credentials_required", message: "Production credentials blocked in homologation" } }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    // 6. Record persistent intent in DB
+    // 6. Inserção persistente da intenção (status 'processing')
     const { data: newIntent, error: insertError } = await supabaseAdmin
       .from("payment_intents")
       .insert({
@@ -249,13 +240,19 @@ serve(async (req) => {
       .single();
 
     if (insertError || !newIntent) {
+      if (insertError?.code === "23505") {
+        return new Response(
+          JSON.stringify({ error: { code: "idempotency_conflict", message: "Concurrent request conflict" } }),
+          { status: 409, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
       return new Response(
-        JSON.stringify({ error: { code: "database_error", message: "Failed to persist payment intent" } }),
+        JSON.stringify({ error: { code: "database_error", message: "Failed to persist intent" } }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // 7. Call Mercado Pago Payments API with application_fee
+    // 7. Chamada ao Mercado Pago Payments API com split 1:1 via application_fee
     const decimalAmount = (amountCents / 100).toFixed(2);
     const decimalFee = (feeCents / 100).toFixed(2);
 
@@ -284,85 +281,131 @@ serve(async (req) => {
       });
       clearTimeout(timeoutId);
     } catch {
-      // Reconcile on network timeout / abort
+      // Reconciliação imediata após timeout / falha de conexão
       const searchRes = await fetch(`https://api.mercadopago.com/v1/payments/search?external_reference=${newIntent.id}`, {
         headers: { Authorization: `Bearer ${sellerAccessToken}` },
       }).catch(() => null);
 
       if (searchRes && searchRes.ok) {
         const searchData = await searchRes.json();
-        if (searchData.results && searchData.results.length > 0) {
-          const found = searchData.results[0];
-          await supabaseAdmin
-            .from("payment_intents")
-            .update({
-              status: found.status === "approved" ? "succeeded" : "requires_action",
+        const found = searchData.results?.find((p: any) =>
+          p.live_mode === false &&
+          String(p.collector_id) === String(oauthConn.seller_id) &&
+          p.currency_id === "BRL" &&
+          Number(p.transaction_amount) === Number(decimalAmount) &&
+          p.external_reference === newIntent.id
+        );
+
+        if (found) {
+          if (found.status === "approved") {
+            await supabaseAdmin.rpc("settle_payment_transaction", {
+              p_intent_id: newIntent.id,
+              p_mp_payment_id: String(found.id),
+              p_status_detail: found.status_detail || "accredited",
+            });
+            return new Response(
+              JSON.stringify({
+                payment: {
+                  id: newIntent.id,
+                  amountCents,
+                  feeCents,
+                  netCents: amountCents - feeCents,
+                  currency: "BRL",
+                  method,
+                  status: "succeeded",
+                  statusDetail: found.status_detail,
+                  mpPaymentId: String(found.id),
+                  replayed: false,
+                  environment: "sandbox",
+                },
+              }),
+              { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          } else {
+            await supabaseAdmin.from("payment_intents").update({
+              status: found.status === "rejected" ? "failed" : "requires_action",
               mp_payment_id: String(found.id),
               mp_status: found.status,
               mp_status_detail: found.status_detail,
-            })
-            .eq("id", newIntent.id);
+            }).eq("id", newIntent.id);
 
-          return new Response(
-            JSON.stringify({
-              payment: {
-                id: newIntent.id,
-                amountCents,
-                feeCents,
-                netCents: amountCents - feeCents,
-                currency: "BRL",
-                method,
-                status: found.status === "approved" ? "succeeded" : "requires_action",
-                statusDetail: found.status_detail,
-                mpPaymentId: String(found.id),
-                replayed: false,
-                environment: "sandbox",
-              },
-            }),
-            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-          );
+            return new Response(
+              JSON.stringify({
+                payment: {
+                  id: newIntent.id,
+                  amountCents,
+                  feeCents,
+                  netCents: amountCents - feeCents,
+                  currency: "BRL",
+                  method,
+                  status: found.status === "rejected" ? "failed" : "requires_action",
+                  statusDetail: found.status_detail,
+                  mpPaymentId: String(found.id),
+                  replayed: false,
+                  environment: "sandbox",
+                },
+              }),
+              { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
         }
       }
 
+      // Se a busca vazia não confirmou cobrança, mantém pendente de reconciliação.
+      // Uma busca vazia NÃO autoriza criar outra cobrança!
       await supabaseAdmin
         .from("payment_intents")
         .update({ status: "requires_reconciliation", error_code: "network_timeout" })
         .eq("id", newIntent.id);
 
       return new Response(
-        JSON.stringify({ error: { code: "gateway_timeout", message: "Upstream gateway timed out; marked for reconciliation" } }),
+        JSON.stringify({ error: { code: "gateway_timeout", message: "Gateway timed out; intent marked for reconciliation" } }),
         { status: 504, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
     const mpData = await mpResponse.json();
 
+    // Validação estrita de modo de teste e parâmetros retornados pelo gateway
     if (mpData.live_mode !== false) {
       await supabaseAdmin.from("payment_intents").update({ status: "failed", error_code: "production_blocked" }).eq("id", newIntent.id);
       return new Response(
-        JSON.stringify({ error: { code: "mp_production_blocked", message: "Production mode is prohibited in sandbox" } }),
+        JSON.stringify({ error: { code: "mp_production_blocked", message: "Production mode is strictly blocked" } }),
+        { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (String(mpData.collector_id) !== String(oauthConn.seller_id) ||
+        mpData.currency_id !== "BRL" ||
+        Number(mpData.transaction_amount) !== Number(decimalAmount) ||
+        mpData.external_reference !== newIntent.id) {
+      await supabaseAdmin.from("payment_intents").update({ status: "failed", error_code: "gateway_validation_mismatch" }).eq("id", newIntent.id);
+      return new Response(
+        JSON.stringify({ error: { code: "gateway_validation_mismatch", message: "Gateway response parameters do not match intent" } }),
         { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
     const isApproved = mpData.status === "approved";
-    const status = isApproved ? "succeeded" : (mpData.status === "rejected" ? "failed" : "requires_action");
 
-    // Update intent
-    await supabaseAdmin
-      .from("payment_intents")
-      .update({
-        status,
+    if (isApproved) {
+      await supabaseAdmin.rpc("settle_payment_transaction", {
+        p_intent_id: newIntent.id,
+        p_mp_payment_id: String(mpData.id),
+        p_status_detail: mpData.status_detail || "accredited",
+      });
+    } else {
+      await supabaseAdmin.from("payment_intents").update({
+        status: mpData.status === "rejected" ? "failed" : "requires_action",
         mp_payment_id: String(mpData.id),
         mp_status: mpData.status,
         mp_status_detail: mpData.status_detail,
         qr_code: mpData.point_of_interaction?.transaction_data?.qr_code ?? null,
         qr_code_base64: mpData.point_of_interaction?.transaction_data?.qr_code_base64 ?? null,
         ticket_url: mpData.point_of_interaction?.transaction_data?.ticket_url ?? null,
-      })
-      .eq("id", newIntent.id);
+      }).eq("id", newIntent.id);
+    }
 
-    // Sanitized output DTO
     return new Response(
       JSON.stringify({
         payment: {
@@ -372,7 +415,7 @@ serve(async (req) => {
           netCents: amountCents - feeCents,
           currency: "BRL",
           method,
-          status,
+          status: isApproved ? "succeeded" : (mpData.status === "rejected" ? "failed" : "requires_action"),
           statusDetail: mpData.status_detail,
           mpPaymentId: String(mpData.id),
           qrCode: mpData.point_of_interaction?.transaction_data?.qr_code ?? null,
@@ -387,7 +430,7 @@ serve(async (req) => {
     );
   } catch (err: any) {
     return new Response(
-      JSON.stringify({ error: { code: "internal_error", message: err.message || "An unexpected error occurred" } }),
+      JSON.stringify({ error: { code: "internal_error", message: "An unexpected error occurred" } }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }

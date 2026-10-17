@@ -5,16 +5,19 @@
   "type": "module",
   "description": "Núcleo financeiro ODIOPAY — Lovable Cloud & Supabase com Mercado Pago Split 1:1 e testes automatizados",
   "engines": {
-    "node": ">=24.0.0 <25"
+    "node": ">=22.0.0"
   },
   "scripts": {
-    "test": "node --test test/*.test.js tests/*.test.js",
+    "test": "node --test test/*.test.js && node --experimental-strip-types --test tests/postgresql-cloud.test.js tests/edge-functions-cloud.test.js",
     "test:original": "node --test test/*.test.js",
-    "test:cloud": "node --test tests/*.test.js",
+    "test:cloud": "node --experimental-strip-types --test tests/postgresql-cloud.test.js tests/edge-functions-cloud.test.js",
     "check": "node scripts/check.js",
     "dashboard": "node scripts/start-dashboard.js",
     "start": "node src/main.js",
     "demo": "node scripts/demo.js",
     "merchant": "node scripts/create-merchant.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
   }
 }

@@ -1,47 +1,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { sha256Hex, encryptAesGcm, decryptAesGcm } from "../_shared/crypto.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
-
-async function sha256Hex(text: string): Promise<string> {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function encryptToken(token: string, secretKeyHex: string, aadContext: string): Promise<string> {
-  const iv = new Uint8Array(12);
-  crypto.getRandomValues(iv);
-
-  const keyBytes = new Uint8Array(secretKeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)));
-  const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt"]);
-
-  const encryptedBuf = await crypto.subtle.encrypt(
-    {
-      name: "AES-GCM",
-      iv,
-      additionalData: new TextEncoder().encode(aadContext),
-      tagLength: 128,
-    },
-    cryptoKey,
-    new TextEncoder().encode(token)
-  );
-
-  const encryptedBytes = new Uint8Array(encryptedBuf);
-  const data = encryptedBytes.slice(0, encryptedBytes.length - 16);
-  const tag = encryptedBytes.slice(encryptedBytes.length - 16);
-
-  return JSON.stringify({
-    v: 1,
-    alg: "aes-256-gcm",
-    iv: btoa(String.fromCharCode(...iv)),
-    tag: btoa(String.fromCharCode(...tag)),
-    data: btoa(String.fromCharCode(...data)),
-  });
-}
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -54,32 +19,71 @@ serve(async (req) => {
     const mpRedirectUri = Deno.env.get("MP_REDIRECT_URI") ?? "";
     const encryptionKey = Deno.env.get("TOKEN_ENCRYPTION_KEY") ?? "";
 
-    const { code, state } = await req.json();
-    if (!code || !state) {
-      return new Response(JSON.stringify({ error: { code: "invalid_parameters" } }), {
-        status: 400,
+    if (!supabaseUrl || !supabaseServiceKey || !mpClientId || !mpClientSecret || !mpRedirectUri || !encryptionKey) {
+      return new Response(JSON.stringify({ error: { code: "configuration_error", message: "Server misconfigured" } }), {
+        status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
+    const authHeader = req.headers.get("authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return new Response(JSON.stringify({ error: { code: "unauthorized", message: "Authorization bearer token required" } }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const token = authHeader.replace("Bearer ", "");
     const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
-    const stateHash = await sha256Hex(state);
+    const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
 
-    // Validate attempt
-    const { data: attempt, error: attemptErr } = await supabaseAdmin
-      .from("mp_oauth_attempts")
-      .select("*")
-      .eq("state_hash", stateHash)
-      .single();
+    if (authError || !user) {
+      return new Response(JSON.stringify({ error: { code: "unauthorized", message: "Invalid session" } }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
-    if (attemptErr || !attempt || new Date(attempt.expires_at) < new Date()) {
-      return new Response(JSON.stringify({ error: { code: "oauth_state_invalid_or_expired" } }), {
+    const { code, state } = await req.json();
+    if (!code || typeof code !== "string" || !state || typeof state !== "string") {
+      return new Response(JSON.stringify({ error: { code: "invalid_parameters", message: "Code and state are required" } }), {
         status: 400,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // Exchange code for token with test_token: true (Homologação)
+    const stateHash = await sha256Hex(state);
+    const sessionHash = await sha256Hex(user.id);
+
+    // Consumo atômico da tentativa vinculada à sessão do lojista
+    const { data: attempts, error: rpcError } = await supabaseAdmin.rpc("consume_oauth_attempt", {
+      p_state_hash: stateHash,
+      p_session_hash: sessionHash,
+    });
+
+    if (rpcError || !attempts || attempts.length === 0) {
+      return new Response(JSON.stringify({ error: { code: "oauth_state_invalid_or_expired", message: "State is invalid, expired, or already used" } }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const attempt = attempts[0];
+
+    // Decifra o PKCE code_verifier usando a chave do backend e AAD
+    const pkceAad = `mp:pkce:${attempt.merchant_id}:${stateHash}`;
+    let codeVerifier = "";
+    try {
+      codeVerifier = await decryptAesGcm(attempt.encrypted_verifier, encryptionKey, pkceAad);
+    } catch {
+      return new Response(JSON.stringify({ error: { code: "decryption_error", message: "Failed to decrypt PKCE verifier" } }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Troca o authorization code por tokens com test_token: true (Homologação)
     const tokenRes = await fetch("https://api.mercadopago.com/oauth/token", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -89,15 +93,15 @@ serve(async (req) => {
         grant_type: "authorization_code",
         code,
         redirect_uri: mpRedirectUri,
-        code_verifier: attempt.sealed_verifier,
+        code_verifier: codeVerifier,
         test_token: true,
       }),
     });
 
     const tokenData = await tokenRes.json();
 
-    if (!tokenRes.ok || tokenData.live_mode !== false || !tokenData.access_token.startsWith("TEST-")) {
-      return new Response(JSON.stringify({ error: { code: "mp_invalid_oauth_response" } }), {
+    if (!tokenRes.ok || tokenData.live_mode !== false || !tokenData.access_token || !tokenData.access_token.startsWith("TEST-")) {
+      return new Response(JSON.stringify({ error: { code: "mp_invalid_oauth_response", message: "Mercado Pago rejected oauth exchange or returned non-test credentials" } }), {
         status: 502,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
@@ -107,27 +111,37 @@ serve(async (req) => {
     const sellerId = String(tokenData.user_id);
     const aadContext = `mp:oauth:${merchantId}:${sellerId}`;
 
-    const encryptedAccessToken = await encryptToken(tokenData.access_token, encryptionKey, aadContext);
-    const encryptedRefreshToken = await encryptToken(tokenData.refresh_token, encryptionKey, aadContext);
+    const encryptedAccessToken = await encryptAesGcm(tokenData.access_token, encryptionKey, aadContext);
+    const encryptedRefreshToken = await encryptAesGcm(tokenData.refresh_token, encryptionKey, aadContext);
 
     const expiresAt = new Date(Date.now() + (tokenData.expires_in || 15552000) * 1000).toISOString();
 
-    // Store encrypted connection
-    await supabaseAdmin.from("mp_oauth_connections").upsert({
-      merchant_id: merchantId,
-      seller_id: sellerId,
-      encrypted_access_token: encryptedAccessToken,
-      encrypted_refresh_token: encryptedRefreshToken,
-      public_key: tokenData.public_key,
-      token_type: "Bearer",
-      expires_at: expiresAt,
-      scope: tokenData.scope || "offline_access",
-      status: "active",
-      updated_at: new Date().toISOString(),
+    // Salva a conexão garantindo que callbacks defasados não sobrescrevam conexões mais novas
+    const { data: saved, error: saveError } = await supabaseAdmin.rpc("save_oauth_connection", {
+      p_merchant_id: merchantId,
+      p_seller_id: sellerId,
+      p_encrypted_access_token: encryptedAccessToken,
+      p_encrypted_refresh_token: encryptedRefreshToken,
+      p_public_key: tokenData.public_key,
+      p_token_type: "Bearer",
+      p_expires_at: expiresAt,
+      p_scope: tokenData.scope || "offline_access",
+      p_attempt_created_at: attempt.created_at,
     });
 
-    // Clean up attempt
-    await supabaseAdmin.from("mp_oauth_attempts").delete().eq("state_hash", stateHash);
+    if (saveError) {
+      return new Response(JSON.stringify({ error: { code: "database_error", message: "Failed to persist oauth connection" } }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (!saved) {
+      return new Response(JSON.stringify({ error: { code: "oauth_connection_outdated", message: "A newer connection already exists; ignoring outdated callback" } }), {
+        status: 409,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     return new Response(
       JSON.stringify({
@@ -139,9 +153,9 @@ serve(async (req) => {
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (err: any) {
-    return new Response(JSON.stringify({ error: { code: "internal_error", message: err.message } }), {
+    return new Response(JSON.stringify({ error: { code: "internal_error", message: "An unexpected error occurred" } }), {
       status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" }
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
 });
